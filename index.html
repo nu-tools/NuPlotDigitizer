@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Plot Digitizer</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #07111f;
+      color: #dde6f0;
+      font-family: 'Courier New', Courier, monospace;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0d1929; }
+    ::-webkit-scrollbar-thumb { background: #1e3a5f; border-radius: 3px; }
+    input[type=number]::-webkit-inner-spin-button { opacity: 0.4; }
+    input:focus { outline: none; }
+    button:focus { outline: none; }
+    label { user-select: none; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+const PALETTE = [
+  '#60a5fa', '#34d399', '#f87171', '#a78bfa',
+  '#fb923c', '#f472b6', '#38bdf8', '#facc15',
+];
+const AXIS_COLOR = { x: '#f59e0b', y: '#10b981' };
+const CAL_SEQUENCE = ['x1', 'x2', 'y1', 'y2'];
+let _uid = 0;
+const uid = () => `s${++_uid}`;
+
+// ─── Math ─────────────────────────────────────────────────────────────────────
+function pxToReal(px, py, cal) {
+  const { xAxis: xa, yAxis: ya } = cal;
+  if (!xa.p1 || !xa.p2 || !ya.p1 || !ya.p2) return null;
+  const xDen = xa.p2.px - xa.p1.px;
+  const yDen = ya.p2.py - ya.p1.py;
+  if (xDen === 0 || yDen === 0) return null;
+
+  let rx, ry;
+  if (xa.log) {
+    if (xa.p1.val <= 0 || xa.p2.val <= 0) return null;
+    rx = Math.exp(Math.log(xa.p1.val) + (px - xa.p1.px) * Math.log(xa.p2.val / xa.p1.val) / xDen);
+  } else {
+    rx = xa.p1.val + (px - xa.p1.px) * (xa.p2.val - xa.p1.val) / xDen;
+  }
+  if (ya.log) {
+    if (ya.p1.val <= 0 || ya.p2.val <= 0) return null;
+    ry = Math.exp(Math.log(ya.p1.val) + (py - ya.p1.py) * Math.log(ya.p2.val / ya.p1.val) / yDen);
+  } else {
+    ry = ya.p1.val + (py - ya.p1.py) * (ya.p2.val - ya.p1.val) / yDen;
+  }
+  return { x: rx, y: ry };
+}
+
+function fmt(v, sig = 6) {
+  if (v === undefined || v === null || isNaN(v)) return '—';
+  const abs = Math.abs(v);
+  if (abs === 0) return '0';
+  if (abs >= 1e-3 && abs < 1e6) return parseFloat(v.toPrecision(sig)).toString();
+  return v.toExponential(sig - 1);
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  const [imgSrc, setImgSrc]       = useState(null);
+  const [imgNat, setImgNat]       = useState({ w: 800, h: 600 });
+  const [scale, setScale]         = useState(1);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+
+  const [cal, setCal] = useState({
+    xAxis: { p1: null, p2: null, log: false },
+    yAxis: { p1: null, p2: null, log: false },
+  });
+  const [calStep, setCalStep] = useState(null); // 'x1'|'x2'|'y1'|'y2'|null
+  const [calInput, setCalInput]   = useState('');
+
+  const firstSeriesId = useMemo(() => uid(), []);
+  const [series, setSeries] = useState([
+    { id: firstSeriesId, name: 'Series 1', color: PALETTE[0], points: [] }
+  ]);
+  const [activeId, setActiveId]   = useState(firstSeriesId);
+  const [hoverDp, setHoverDp]     = useState(null); // display pixels
+  const [dragInfo, setDragInfo]   = useState(null);  // { seriesId, idx }
+  const [stage, setStage]         = useState('upload');
+
+  const canvasRef   = useRef(null);
+  const calInputRef = useRef(null);
+
+  const MAX_W = 860, MAX_H = 620;
+  const s = scale;
+  const dispW = imgNat.w * s;
+  const dispH = imgNat.h * s;
+
+  const dToI = useCallback((dx, dy) => ({ x: dx / s, y: dy / s }), [s]);
+  const iToD = useCallback((ix, iy) => ({ x: ix * s, y: iy * s }), [s]);
+
+  const isCalibrated = useMemo(() =>
+    cal.xAxis.p1 && cal.xAxis.p2 && cal.yAxis.p1 && cal.yAxis.p2,
+  [cal]);
+
+  // ── Recalculate points after calibration change ──
+  const recalcAll = useCallback((newCal) => {
+    setSeries(prev => prev.map(ser => ({
+      ...ser,
+      points: ser.points.map(p => {
+        const r = pxToReal(p.px, p.py, newCal);
+        return r ? { ...p, x: r.x, y: r.y } : p;
+      }),
+    })));
+  }, []);
+
+  // ── Canvas draw ──
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Crosshair
+    if (hoverDp) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 5]);
+      ctx.beginPath();
+      ctx.moveTo(hoverDp.x, 0); ctx.lineTo(hoverDp.x, canvas.height);
+      ctx.moveTo(0, hoverDp.y); ctx.lineTo(canvas.width, hoverDp.y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Draw a calibration dot
+    const calDot = (p, color, label) => {
+      if (!p) return;
+      const d = iToD(p.px, p.py);
+      // Arms
+      ctx.save();
+      ctx.strokeStyle = color + '77';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(d.x - 18, d.y); ctx.lineTo(d.x + 18, d.y);
+      ctx.moveTo(d.x, d.y - 18); ctx.lineTo(d.x, d.y + 18);
+      ctx.stroke();
+      // Dot
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = '#07111f';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // Label
+      ctx.fillStyle = '#f8fafc';
+      ctx.font = 'bold 10px Courier New';
+      ctx.fillText(label, d.x + 9, d.y - 6);
+      ctx.restore();
+    };
+
+    calDot(cal.xAxis.p1, AXIS_COLOR.x, `X1=${cal.xAxis.p1?.val}`);
+    calDot(cal.xAxis.p2, AXIS_COLOR.x, `X2=${cal.xAxis.p2?.val}`);
+    calDot(cal.yAxis.p1, AXIS_COLOR.y, `Y1=${cal.yAxis.p1?.val}`);
+    calDot(cal.yAxis.p2, AXIS_COLOR.y, `Y2=${cal.yAxis.p2?.val}`);
+
+    // Draw data series
+    series.forEach(ser => {
+      const isActive = ser.id === activeId;
+      ser.points.forEach((p, i) => {
+        const d = iToD(p.px, p.py);
+        const isDrag = dragInfo?.seriesId === ser.id && dragInfo?.idx === i;
+        const r = isDrag ? 10 : isActive ? 7 : 5;
+
+        ctx.save();
+        if (isActive) {
+          ctx.strokeStyle = ser.color + '55';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(d.x - r - 5, d.y); ctx.lineTo(d.x + r + 5, d.y);
+          ctx.moveTo(d.x, d.y - r - 5); ctx.lineTo(d.x, d.y + r + 5);
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = isDrag ? '#fff' : ser.color;
+        ctx.fill();
+        ctx.strokeStyle = '#07111f';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        ctx.restore();
+      });
+    });
+  }, [hoverDp, cal, series, activeId, dragInfo, iToD, dispW, dispH]);
+
+  // ── File handling ──
+  const loadFile = (file) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const url = URL.createObjectURL(file);
+    setImgSrc(url);
+    setCal({ xAxis: { p1: null, p2: null, log: false }, yAxis: { p1: null, p2: null, log: false } });
+    setSeries(prev => prev.map(s => ({ ...s, points: [] })));
+    setStage('calibrate');
+    setCalStep('x1');
+  };
+
+  const handleFileInput = (e) => loadFile(e.target.files[0]);
+  const handleImgLoad = (e) => {
+    const { naturalWidth: w, naturalHeight: h } = e.target;
+    const sc = Math.min(1, MAX_W / w, MAX_H / h);
+    setImgNat({ w, h });
+    setScale(sc);
+  };
+
+  // ── Drag-over for file drop ──
+  const handleDragOver = (e) => { e.preventDefault(); setIsDraggingFile(true); };
+  const handleDragLeave = () => setIsDraggingFile(false);
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDraggingFile(false);
+    loadFile(e.dataTransfer.files[0]);
+  };
+
+  // ── Canvas pointer helpers ──
+  const getDP = (e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  };
+
+  const nearPoint = (dpx, dpy, threshold = 14) => {
+    for (const ser of series) {
+      for (let i = 0; i < ser.points.length; i++) {
+        const d = iToD(ser.points[i].px, ser.points[i].py);
+        if (Math.hypot(d.x - dpx, d.y - dpy) < threshold) {
+          return { seriesId: ser.id, idx: i };
+        }
+      }
+    }
+    return null;
+  };
+
+  // ── Pointer events ──
+  const handleMouseDown = (e) => {
+    if (stage !== 'digitize' || calStep) return;
+    const dp = getDP(e);
+    const near = nearPoint(dp.x, dp.y);
+    if (near) setDragInfo(near);
+  };
+
+  const handleMouseMove = (e) => {
+    if (!imgSrc) return;
+    const dp = getDP(e);
+    setHoverDp(dp);
+
+    if (dragInfo) {
+      const ip = dToI(dp.x, dp.y);
+      const r  = pxToReal(ip.x, ip.y, cal);
+      setSeries(prev => prev.map(ser => {
+        if (ser.id !== dragInfo.seriesId) return ser;
+        return {
+          ...ser,
+          points: ser.points.map((p, i) =>
+            i !== dragInfo.idx ? p : { px: ip.x, py: ip.y, x: r?.x ?? p.x, y: r?.y ?? p.y }
+          ),
+        };
+      }));
+    }
+  };
+
+  const handleMouseUp = () => setDragInfo(null);
+
+  const handleClick = (e) => {
+    if (!imgSrc || dragInfo) return;
+    const dp = getDP(e);
+    const ip = dToI(dp.x, dp.y);
+
+    // Calibration click
+    if (calStep) {
+      const val = parseFloat(calInput);
+      if (isNaN(val)) { alert('Please enter a numeric value first.'); return; }
+      const logMode = calStep.startsWith('x') ? cal.xAxis.log : cal.yAxis.log;
+      if (logMode && val <= 0) { alert('Log scale requires positive values.'); return; }
+
+      const point = { px: ip.x, py: ip.y, val };
+      let newCal = { ...cal };
+      if      (calStep === 'x1') newCal = { ...cal, xAxis: { ...cal.xAxis, p1: point } };
+      else if (calStep === 'x2') newCal = { ...cal, xAxis: { ...cal.xAxis, p2: point } };
+      else if (calStep === 'y1') newCal = { ...cal, yAxis: { ...cal.yAxis, p1: point } };
+      else if (calStep === 'y2') newCal = { ...cal, yAxis: { ...cal.yAxis, p2: point } };
+
+      setCal(newCal);
+      recalcAll(newCal);
+      setCalInput('');
+
+      const nextIdx = CAL_SEQUENCE.indexOf(calStep) + 1;
+      if (nextIdx < CAL_SEQUENCE.length) {
+        setCalStep(CAL_SEQUENCE[nextIdx]);
+      } else {
+        setCalStep(null);
+        setStage('digitize');
+      }
+      return;
+    }
+
+    // Add data point
+    if (stage === 'digitize') {
+      if (nearPoint(dp.x, dp.y)) return; // clicked on existing point
+      const r = pxToReal(ip.x, ip.y, cal);
+      if (!r) return;
+      setSeries(prev => prev.map(ser =>
+        ser.id !== activeId ? ser : { ...ser, points: [...ser.points, { px: ip.x, py: ip.y, x: r.x, y: r.y }] }
+      ));
+    }
+  };
+
+  // ── Series management ──
+  const addSeries = () => {
+    const id = uid();
+    const color = PALETTE[series.length % PALETTE.length];
+    setSeries(prev => [...prev, { id, name: `Series ${prev.length + 1}`, color, points: [] }]);
+    setActiveId(id);
+  };
+
+  const removeSeries = (id) => {
+    setSeries(prev => {
+      const next = prev.filter(s => s.id !== id);
+      if (activeId === id && next.length) setActiveId(next[0].id);
+      return next;
+    });
+  };
+
+  const deletePoint = (seriesId, idx) => {
+    setSeries(prev => prev.map(s =>
+      s.id !== seriesId ? s : { ...s, points: s.points.filter((_, i) => i !== idx) }
+    ));
+  };
+
+  // ── Export ──
+  const exportCSV = (ser) => {
+    const rows = ['x,y', ...ser.points.map(p => `${p.x},${p.y}`)];
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${ser.name.replace(/\s+/g, '_')}.csv`;
+    a.click();
+  };
+
+  const exportAll = () => {
+    const rows = ['series,x,y'];
+    series.forEach(s => s.points.forEach(p => rows.push(`"${s.name}",${p.x},${p.y}`)));
+    const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'digitized_data.csv';
+    a.click();
+  };
+
+  const totalPts = series.reduce((a, s) => a + s.points.length, 0);
+  const activeSer = series.find(s => s.id === activeId);
+
+  const hoverReal = (hoverDp && isCalibrated && stage === 'digitize' && !calStep)
+    ? (() => { const ip = dToI(hoverDp.x, hoverDp.y); return pxToReal(ip.x, ip.y, cal); })()
+    : null;
+
+  // ── Calibration helper: set or clear a point ──
+  const clearCalPoint = (axis, key) => {
+    const newCal = { ...cal, [axis]: { ...cal[axis], [key]: null } };
+    setCal(newCal);
+    recalcAll(newCal);
+    if (stage === 'digitize') setStage('calibrate');
+  };
+
+  const setCalLog = (axis, log) => {
+    const newCal = { ...cal, [axis]: { ...cal[axis], log } };
+    setCal(newCal);
+    recalcAll(newCal);
+  };
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', padding: '18px 22px', gap: '14px' }}>
+
+      {/* ── Header ── */}
+      <header style={{ display: 'flex', alignItems: 'center', gap: '14px', borderBottom: '1px solid #152236', paddingBottom: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: '10px' }}>
+          <span style={{ fontSize: '17px', fontWeight: 'bold', letterSpacing: '0.18em', color: '#60a5fa', textTransform: 'uppercase' }}>
+            Plot Digitizer
+          </span>
+          <span style={{ fontSize: '10px', color: '#1e3a5f' }}>v1.1.0</span>
+        </div>
+        <div style={{ flex: 1 }} />
+        <StepPip label="1 · Upload"    active={stage === 'upload'}    done={stage !== 'upload'} />
+        <StepPip label="2 · Calibrate" active={stage === 'calibrate'} done={stage === 'digitize'} />
+        <StepPip label="3 · Digitize"  active={stage === 'digitize'}  done={false} />
+      </header>
+
+      {/* ── Main ── */}
+      <div style={{ display: 'flex', gap: '18px', flex: 1, alignItems: 'flex-start' }}>
+
+        {/* ── Canvas / Upload zone ── */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {!imgSrc ? (
+            <label
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              style={{
+                display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                height: '420px', border: `2px dashed ${isDraggingFile ? '#60a5fa' : '#1e3a5f'}`,
+                borderRadius: '10px', cursor: 'pointer', gap: '14px', color: '#334155',
+                transition: 'all 0.2s', background: isDraggingFile ? '#60a5fa08' : 'transparent',
+              }}
+            >
+              <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke={isDraggingFile ? '#60a5fa' : '#334155'} strokeWidth="1.2" style={{ transition: 'stroke 0.2s' }}>
+                <rect x="2" y="3" width="20" height="18" rx="2.5" />
+                <path d="M2 8.5l5-5 5 5 4.5-7L21 10" strokeLinejoin="round" />
+                <circle cx="7.5" cy="7.5" r="1.8" fill={isDraggingFile ? '#60a5fa' : '#334155'} stroke="none" />
+              </svg>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: '14px', color: isDraggingFile ? '#60a5fa' : '#64748b', marginBottom: '4px' }}>
+                  {isDraggingFile ? 'Drop it!' : 'Click to upload or drag & drop'}
+                </div>
+                <div style={{ fontSize: '11px', color: '#1e3a5f' }}>PNG · JPG · GIF · WebP · SVG</div>
+              </div>
+              <input type="file" accept="image/*" onChange={handleFileInput} style={{ display: 'none' }} />
+            </label>
+          ) : (
+            <div>
+              <div style={{ position: 'relative', display: 'inline-block', lineHeight: 0 }}>
+                <img
+                  src={imgSrc} onLoad={handleImgLoad}
+                  style={{ width: dispW, height: dispH, display: 'block', borderRadius: '5px', border: '1px solid #152236', userSelect: 'none', pointerEvents: 'none' }}
+                  alt="plot" draggable={false}
+                />
+                <canvas
+                  ref={canvasRef} width={dispW} height={dispH}
+                  onClick={handleClick}
+                  onMouseDown={handleMouseDown}
+                  onMouseMove={handleMouseMove}
+                  onMouseUp={handleMouseUp}
+                  onMouseLeave={() => { setHoverDp(null); setDragInfo(null); }}
+                  style={{
+                    position: 'absolute', top: 0, left: 0,
+                    cursor: dragInfo ? 'grabbing' : calStep ? 'crosshair' : stage === 'digitize' ? 'crosshair' : 'default',
+                  }}
+                />
+                {/* Calibration overlay prompt */}
+                {calStep && (
+                  <div style={{
+                    position: 'absolute', top: '10px', left: '50%', transform: 'translateX(-50%)',
+                    background: 'rgba(7,17,31,0.92)', borderRadius: '6px', padding: '5px 14px',
+                    border: `1px solid ${calStep.startsWith('x') ? AXIS_COLOR.x : AXIS_COLOR.y}55`,
+                    fontSize: '11px', color: calStep.startsWith('x') ? AXIS_COLOR.x : AXIS_COLOR.y,
+                    pointerEvents: 'none', whiteSpace: 'nowrap', letterSpacing: '0.05em',
+                  }}>
+                    ↑ Click to place {calStep.toUpperCase()} = {calInput || '?'}
+                  </div>
+                )}
+                {/* Hover coord readout */}
+                {hoverReal && (
+                  <div style={{
+                    position: 'absolute', bottom: '8px', left: '8px',
+                    background: 'rgba(7,17,31,0.9)', border: '1px solid #152236', borderRadius: '4px',
+                    padding: '3px 10px', fontSize: '11px', color: activeSer?.color ?? '#60a5fa',
+                    pointerEvents: 'none', letterSpacing: '0.03em',
+                  }}>
+                    x = {fmt(hoverReal.x, 5)} &nbsp;&nbsp; y = {fmt(hoverReal.y, 5)}
+                  </div>
+                )}
+              </div>
+              <div style={{ marginTop: '8px' }}>
+                <label style={{ fontSize: '11px', color: '#334155', cursor: 'pointer', textDecoration: 'underline', textUnderlineOffset: '2px' }}>
+                  Load new image
+                  <input type="file" accept="image/*" onChange={handleFileInput} style={{ display: 'none' }} />
+                </label>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Right panel ── */}
+        <div style={{ width: '292px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: '12px' }}>
+
+          {/* Calibration */}
+          <Panel title="AXIS CALIBRATION" color="#94a3b8" glow={!!calStep}>
+            <AxisCal
+              label="X AXIS" color={AXIS_COLOR.x}
+              axis={cal.xAxis}
+              calStep={calStep}
+              setCalStep={(step) => { setCalStep(step); setCalInput(''); setTimeout(() => calInputRef.current?.focus(), 50); }}
+              calInput={calInput}
+              setCalInput={setCalInput}
+              calInputRef={calInputRef}
+              axisKey="xAxis"
+              onClear={(key) => clearCalPoint('xAxis', key)}
+              onLogToggle={(v) => setCalLog('xAxis', v)}
+            />
+            <div style={{ height: '1px', background: '#152236', margin: '8px 0' }} />
+            <AxisCal
+              label="Y AXIS" color={AXIS_COLOR.y}
+              axis={cal.yAxis}
+              calStep={calStep}
+              setCalStep={(step) => { setCalStep(step); setCalInput(''); setTimeout(() => calInputRef.current?.focus(), 50); }}
+              calInput={calInput}
+              setCalInput={setCalInput}
+              calInputRef={calInputRef}
+              axisKey="yAxis"
+              onClear={(key) => clearCalPoint('yAxis', key)}
+              onLogToggle={(v) => setCalLog('yAxis', v)}
+            />
+            {calStep && (
+              <button onClick={() => setCalStep(null)}
+                style={{ ...miniBtn('#64748b'), marginTop: '8px', width: '100%', textAlign: 'center', fontSize: '10px' }}>
+                Cancel placing point
+              </button>
+            )}
+          </Panel>
+
+          {/* Series */}
+          <Panel title={`DATA SERIES  (${series.length})`} color="#60a5fa" glow={stage === 'digitize'}>
+            {series.map(ser => (
+              <div key={ser.id}
+                onClick={() => { setActiveId(ser.id); }}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: '6px',
+                  padding: '5px 8px', borderRadius: '4px', cursor: 'pointer', marginBottom: '3px',
+                  background: activeId === ser.id ? ser.color + '18' : 'transparent',
+                  border: `1px solid ${activeId === ser.id ? ser.color + '44' : 'transparent'}`,
+                  transition: 'all 0.15s',
+                }}
+              >
+                <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: ser.color, flexShrink: 0 }} />
+                <input
+                  value={ser.name}
+                  onChange={e => setSeries(prev => prev.map(x => x.id !== ser.id ? x : { ...x, name: e.target.value }))}
+                  onClick={e => e.stopPropagation()}
+                  style={{ background: 'none', border: 'none', color: '#dde6f0', fontSize: '11px', flex: 1, fontFamily: 'Courier New, monospace', cursor: 'text', padding: 0 }}
+                />
+                <span style={{ fontSize: '10px', color: '#334155', flexShrink: 0 }}>{ser.points.length}pt</span>
+                <button onClick={e => { e.stopPropagation(); exportCSV(ser); }}
+                  title="Export CSV"
+                  style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: '13px', lineHeight: 1, padding: '0 1px' }}>
+                  ↓
+                </button>
+                {series.length > 1 && (
+                  <button onClick={e => { e.stopPropagation(); removeSeries(ser.id); }}
+                    style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', fontSize: '15px', lineHeight: 1, padding: '0 1px' }}>
+                    ×
+                  </button>
+                )}
+              </div>
+            ))}
+            <button onClick={addSeries} style={{ ...miniBtn('#60a5fa'), width: '100%', textAlign: 'center', marginTop: '6px' }}>
+              + Add series
+            </button>
+          </Panel>
+
+          {/* Points table */}
+          {activeSer && stage === 'digitize' && (
+            <Panel title={`POINTS — ${activeSer.name}`} color={activeSer.color} glow={true}>
+              {activeSer.points.length === 0 ? (
+                <span style={{ fontSize: '11px', color: '#334155' }}>Click the plot to add points.</span>
+              ) : (
+                <div style={{ maxHeight: '210px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                  {activeSer.points.map((p, i) => (
+                    <div key={i} style={{
+                      display: 'flex', alignItems: 'center', gap: '4px',
+                      fontSize: '10px', padding: '3px 5px', borderRadius: '3px',
+                      background: 'rgba(255,255,255,0.025)',
+                    }}>
+                      <span style={{ color: '#334155', width: '20px', flexShrink: 0 }}>{i + 1}.</span>
+                      <span style={{ color: activeSer.color, flex: 1, letterSpacing: '0.02em' }}>
+                        {fmt(p.x, 5)}, {fmt(p.y, 5)}
+                      </span>
+                      <button onClick={() => deletePoint(activeSer.id, i)}
+                        style={{ background: 'none', border: 'none', color: '#334155', cursor: 'pointer', fontSize: '14px', lineHeight: 1, padding: '0 2px' }}>
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Panel>
+          )}
+
+          {/* Export */}
+          {totalPts > 0 && (
+            <button onClick={exportAll}
+              style={{
+                background: '#60a5fa18', border: '1px solid #60a5fa44', color: '#60a5fa',
+                fontSize: '11px', padding: '8px 14px', borderRadius: '5px', cursor: 'pointer',
+                fontFamily: 'Courier New, monospace', letterSpacing: '0.07em', width: '100%',
+                transition: 'background 0.15s',
+              }}
+              onMouseEnter={e => e.currentTarget.style.background = '#60a5fa28'}
+              onMouseLeave={e => e.currentTarget.style.background = '#60a5fa18'}
+            >
+              ↓ Export All ({totalPts} pts)
+            </button>
+          )}
+
+          {/* Help */}
+          <div style={{ fontSize: '10px', color: '#1e3a5f', lineHeight: '1.7', marginTop: '4px' }}>
+            {stage === 'calibrate' && !calStep && '→ Set at least 2 X and 2 Y reference points.'}
+            {calStep && `→ Type value · then click on the image to place ${calStep.toUpperCase()}.`}
+            {stage === 'digitize' && !calStep && '→ Click to add points · drag to move · × to delete.'}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── AxisCal sub-component ────────────────────────────────────────────────────
+function AxisCal({ label, color, axis, calStep, setCalStep, calInput, setCalInput, calInputRef, axisKey, onClear, onLogToggle }) {
+  const steps = axisKey === 'xAxis' ? ['x1', 'x2'] : ['y1', 'y2'];
+  const points = [axis.p1, axis.p2];
+  const pkeys  = ['p1', 'p2'];
+
+  return (
+    <div style={{ marginBottom: '4px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
+        <span style={{ fontSize: '9px', fontWeight: 'bold', letterSpacing: '0.12em', color }}>{label}</span>
+        <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '10px', color: '#475569', marginLeft: 'auto', cursor: 'pointer' }}>
+          <input type="checkbox" checked={axis.log} onChange={e => onLogToggle(e.target.checked)}
+            style={{ width: '11px', height: '11px', accentColor: color }} />
+          Log scale
+        </label>
+      </div>
+      {points.map((pt, i) => {
+        const step  = steps[i];
+        const pkey  = pkeys[i];
+        const isActive = calStep === step;
+
+        return (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
+            <span style={{ fontSize: '10px', color: '#334155', width: '22px', flexShrink: 0 }}>
+              {axisKey === 'xAxis' ? 'X' : 'Y'}{i + 1}
+            </span>
+            {pt ? (
+              <>
+                <span style={{ fontSize: '10px', color, flex: 1 }}>= {pt.val} ✓</span>
+                <button onClick={() => onClear(pkey)}
+                  style={{ background: 'none', border: 'none', color: '#334155', cursor: 'pointer', fontSize: '14px', lineHeight: 1, flexShrink: 0 }}>×</button>
+              </>
+            ) : isActive ? (
+              <input
+                ref={calInputRef}
+                type="number" value={calInput} onChange={e => setCalInput(e.target.value)}
+                placeholder={`${axisKey === 'xAxis' ? 'X' : 'Y'}${i + 1} value`}
+                style={{ ...inputSt, flex: 1 }}
+                onKeyDown={e => e.key === 'Enter' && e.preventDefault()}
+              />
+            ) : (
+              <button onClick={() => setCalStep(step)} style={{ ...miniBtn(color), flex: 1, textAlign: 'center' }}>
+                Set {axisKey === 'xAxis' ? 'X' : 'Y'}{i + 1}
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── UI atoms ─────────────────────────────────────────────────────────────────
+function Panel({ title, color, glow, children }) {
+  return (
+    <div style={{
+      border: `1px solid ${glow ? color + '44' : '#152236'}`,
+      borderRadius: '7px', padding: '12px',
+      background: glow ? color + '07' : 'transparent',
+      transition: 'all 0.25s',
+    }}>
+      <div style={{
+        fontSize: '9px', fontWeight: 'bold', letterSpacing: '0.14em',
+        color: glow ? color : '#1e3a5f', marginBottom: '10px',
+        display: 'flex', alignItems: 'center', gap: '6px',
+        textTransform: 'uppercase',
+      }}>
+        {glow && (
+          <span style={{
+            width: '5px', height: '5px', borderRadius: '50%',
+            background: color, boxShadow: `0 0 6px ${color}`, display: 'inline-block', flexShrink: 0,
+          }} />
+        )}
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function StepPip({ label, active, done }) {
+  const color = active ? '#60a5fa' : done ? '#34d399' : '#1e3a5f';
+  return (
+    <span style={{ fontSize: '10px', color, fontWeight: active ? 'bold' : 'normal', transition: 'color 0.3s', letterSpacing: '0.04em' }}>
+      {label}
+    </span>
+  );
+}
+
+const inputSt = {
+  background: '#0d1929', border: '1px solid #1e3a5f', borderRadius: '3px',
+  color: '#dde6f0', padding: '4px 7px', fontSize: '11px',
+  fontFamily: 'Courier New, monospace', outline: 'none',
+};
+
+const miniBtn = (color) => ({
+  background: color + '15', border: `1px solid ${color}44`, color,
+  fontSize: '10px', padding: '4px 8px', borderRadius: '3px',
+  cursor: 'pointer', fontFamily: 'Courier New, monospace', letterSpacing: '0.04em',
+});
+
+// ─── Mount ────────────────────────────────────────────────────────────────────
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
